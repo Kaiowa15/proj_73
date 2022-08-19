@@ -7,10 +7,13 @@ import {
   Text,
   ImageBackground,
   Image,
-  Alert
+  Alert,
+  KeyboardAvoidingView,
+  ToastAndroid
 } from "react-native";
 import * as Permissions from "expo-permissions";
 import { BarCodeScanner } from "expo-barcode-scanner";
+import firebase from "firebase";
 import db from "../config";
 
 const bgImage = require("../assets/background2.png");
@@ -24,7 +27,9 @@ export default class RideScreen extends Component {
       userId: "",
       domState: "normal",
       hasCameraPermissions: null,
-      scanned: false
+      scanned: false,
+      bikeType: "",
+      userName: ""
     };
   }
 
@@ -33,7 +38,7 @@ export default class RideScreen extends Component {
 
     this.setState({
       /*status === "granted" é verdadeiro se o usuário concedeu permissão
-          status === "granted" é falso se o usuário não concedeu a permissão
+          status === "granted" é falso se o usuário não concedeu permissão
         */
       hasCameraPermissions: status === "granted",
       domState: "scanner",
@@ -49,31 +54,253 @@ export default class RideScreen extends Component {
     });
   };
 
-  handleTransaction = () => {
-    var { bikeId } = this.state;
+  handleTransaction = async () => {
+    var { bikeId, userId } = this.state;
+    await this.getBikeDetails(bikeId);
+    await this.getUserDetails(userId);
+
+    var transactionType = await this.checkBikeAvailability(bikeId);
+
+    if (!transactionType) {
+      this.setState({ bikeId: "" });
+      Alert.alert("Por favor insira/digitalize um ID válido");
+    } else if (transactionType === "under_maintenance") {
+      this.setState({
+        bikeId: ""
+      });
+    } else if (transactionType === "rented") {
+      var isEligible = await this.checkUserEligibilityForStartRide(userId);
+
+      if (isEligible) {
+        var { bikeType, userName } = this.state;
+        this.assignBike(bikeId, userId, bikeType, userName);
+        Alert.alert(
+          "Você alugou a bicicleta pela próxima 1 hora. Aproveite seu passeio!!"
+        );
+        this.setState({
+          bikeAssigned: true
+        });
+
+        // For Android users only
+        // ToastAndroid.show(
+        //   "Você alugou a bicicleta pela próxima 1 hora. Aproveite seu passeio!!",
+        //   ToastAndroid.SHORT
+        // );
+      }
+    } else {
+      var isEligible = await this.checkUserEligibilityForEndRide(
+        bikeId,
+        userId
+      );
+
+      if (isEligible) {
+        var { bikeType, userName } = this.state;
+        this.returnBike(bikeId, userId, bikeType, userName);
+        Alert.alert("Esperamos que tenha gostado do seu passeio");
+        this.setState({
+          bikeAssigned: false
+        });
+
+        // For Android users only
+        // ToastAndroid.show(
+        //   "Esperamos que tenha gostado do seu passeio",
+        //   ToastAndroid.SHORT
+        // );
+      }
+    }
+  };
+
+  getBikeDetails = bikeId => {
+    bikeId = bikeId.trim();
     db.collection("bicycles")
-      .doc(bikeId)
+      .where("id", "==", bikeId)
       .get()
-      .then(doc => {
-        var bike = doc.data();
-        if (bike.is_bike_available) {
-          this.assignBike();
-        } else {
-          this.initiateBookReturn();
-        }
+      .then(snapshot => {
+        snapshot.docs.map(doc => {
+          this.setState({
+            bikeType: doc.data().bike_type
+          });
+        });
       });
   };
 
-  assignBike = () => {
-    console.log("Você alugou a bicicleta pela próxima 1 hora. Aproveite seu passeio!!");
+  getUserDetails = userId => {
+    db.collection("users")
+      .where("id", "==", userId)
+      .get()
+      .then(snapshot => {
+        snapshot.docs.map(doc => {
+
+          //this.setState(
+          //  userName: doc.data().name,
+          //  userId: doc.data().id,
+          //  bikeAssigned: doc.data().bike_assigned
+          //);
+          
+          //this.setState({
+          //  userName= doc.data().name,
+          //  userId= doc.data().id,
+          //  bikeAssigned= doc.data().bike_assigned
+          //});
+
+          //this.setState({
+          //  userName: doc.data().name
+          //  userId: doc.data().id
+          //  bikeAssigned: doc.data().bike_assigned
+          //});
+
+          this.setState({
+            userName: doc.data().name,
+            userId: doc.data().id,
+            bikeAssigned: doc.data().bike_assigned
+          });
+
+        });
+      });
   };
 
-  returnBike = () => {
-    console.log("Esperamos que tenha gostado do seu passeio");
+  checkBikeAvailability = async bikeId => {
+    const bikeRef = await db
+      .collection("bicycles")
+      .where("id", "==", bikeId)
+      .get();
+
+    var transactionType = "";
+    if (bikeRef.docs.length == 0) {
+      transactionType = false;
+    } else {
+      bikeRef.docs.map(doc => {
+        if (!doc.data().under_maintenance) {
+          // se a bicicleta estiver disponível, o tipo de transação será "rented",
+          // caso contrário, será "return"
+
+          transactionType = doc.data().is_bike_available ? "rented" : "return";
+          //transactionType = doc.data().is_bike_available ? "rented" ? "return";
+          //transactionType === doc.data().is_bike_available ? "rented" : "return";
+          //transactionType = doc.data().is_bike_available ? "rented" "return";
+
+        } else {
+          transactionType = "under_maintenance";
+          Alert.alert(doc.data().maintenance_message);
+        }
+      });
+    }
+
+    return transactionType;
+  };
+
+  checkUserEligibilityForStartRide = async userId => {
+    const userRef = await db
+      .collection("users")
+      .where("id", "==", userId)
+      .get();
+
+    var isUserEligible = false;
+    if (userRef.docs.length == 0) {
+      this.setState({
+        bikeId: ""
+      });
+      isUserEligible = false;
+      Alert.alert("Id de Usuário inválido");
+    } else {
+      userRef.docs.map(doc => {
+        if (!doc.data().bike_assigned) {
+          isUserEligible = true;
+        } else {
+          isUserEligible = false;
+          Alert.alert("Finalize o passeio atual para alugar outra bicicleta");
+          this.setState({
+            bikeId: ""
+          });
+        }
+      });
+    }
+
+    return isUserEligible;
+  };
+
+  checkUserEligibilityForEndRide = async (bikeId, userId) => {
+    const transactionRef = await db
+      .collection("transactions")
+      .where("bike_id", "==", bikeId)
+      .limit(1)
+      .get();
+    var isUserEligible = "";
+    transactionRef.docs.map(doc => {
+      var lastBikeTransaction = doc.data();
+      if (lastBikeTransaction.user_id === userId) {
+        isUserEligible = true;
+      } else {
+        isUserEligible = false;
+        Alert.alert("Essa bicicleta está alugada por outro usuário");
+        this.setState({
+          bikeId: ""
+        });
+      }
+    });
+    return isUserEligible;
+  };
+
+  assignBike = async (bikeId, userId, bikeType, userName) => {
+    // adicionar uma transação
+    db.collection("transactions").add({
+      user_id: userId,
+      user_name: userName,
+      bike_id: bikeId,
+      bike_type: bikeType,
+      date: firebase.firestore.Timestamp.now().toDate(),
+      transaction_type: "rented"
+    });
+    // alterar status da bicicleta
+    db.collection("bicycles")
+      .doc(bikeId)
+      .update({
+        is_bike_available: false
+      });
+    // mudar o valor referente a bicicleta alugada pelo usuário
+    db.collection("users")
+      .doc(userId)
+      .update({
+        bike_assigned: true
+      });
+
+    // atualizando estado local
+    this.setState({
+      bikeId: ""
+    });
+  };
+
+  returnBike = async (bikeId, userId, bikeType, userName) => {
+    // adicionar uma transação
+    db.collection("transactions").add({
+      user_id: userId,
+      user_name: userName,
+      bike_id: bikeId,
+      bike_type: bikeType,
+      date: firebase.firestore.Timestamp.now().toDate(),
+      transaction_type: "return"
+    });
+    // alterar status da bicicleta
+    db.collection("bicycles")
+      .doc(bikeId)
+      .update({
+        is_bike_available: true
+      });
+    // mudar o valor referente a bicicleta alugada pelo usuário
+    db.collection("users")
+      .doc(userId)
+      .update({
+        bike_assigned: false
+      });
+
+    // atualizando estado local
+    this.setState({
+      bikeId: ""
+    });
   };
 
   render() {
-    const { bikeId, userId, domState, scanned } = this.state;
+    const { bikeId, userId, domState, scanned, bikeAssigned } = this.state;
     if (domState !== "normal") {
       return (
         <BarCodeScanner
@@ -83,7 +310,7 @@ export default class RideScreen extends Component {
       );
     }
     return (
-      <View style={styles.container}>
+      <KeyboardAvoidingView behavior="padding" style={styles.container}>
         <View style={styles.upperContainer}>
           <Image source={appIcon} style={styles.appIcon} />
           <Text style={styles.title}>Ciclista Eletrônico</Text>
@@ -102,9 +329,11 @@ export default class RideScreen extends Component {
           <View style={[styles.textinputContainer, { marginTop: 25 }]}>
             <TextInput
               style={styles.textinput}
+              onChangeText={text => this.setState({ bikeId: text })}
               placeholder={"Id da Bicicleta"}
               placeholderTextColor={"#FFFFFF"}
               value={bikeId}
+              autoFocus
             />
             <TouchableOpacity
               style={styles.scanbutton}
@@ -113,14 +342,17 @@ export default class RideScreen extends Component {
               <Text style={styles.scanbuttonText}>Digitalizar</Text>
             </TouchableOpacity>
           </View>
+
           <TouchableOpacity
             style={[styles.button, { marginTop: 25 }]}
             onPress={this.handleTransaction}
           >
-            <Text style={styles.buttonText}>Desbloquear</Text>
+            <Text style={styles.buttonText}>
+              {bikeAssigned ? "Finalizar" : "Desbloquear"}
+            </Text>
           </TouchableOpacity>
         </View>
-      </View>
+      </KeyboardAvoidingView>
     );
   }
 }
